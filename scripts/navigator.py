@@ -36,20 +36,35 @@ import subprocess
 import re
 from typing import Dict, List, Any, Optional, Tuple
 
+# Import common utilities
+from common_utils import (
+    ErrorHandler, StructuredLogger, ErrorCategory, ErrorSeverity, AndroidAutomationError,
+    parse_device_args, format_json_output, validate_required_tools
+)
+
 class AndroidNavigator:
-    def __init__(self, device_id: Optional[str] = None):
+    def __init__(self, device_id: Optional[str] = None, verbose: bool = False):
         self.device_id = device_id
-        self.device_prefix = f"-s {device_id}" if device_id else ""
+        self.device_prefix = parse_device_args(device_id)
+
+        # Initialize error handling and logging
+        self.error_handler = ErrorHandler("navigator")
+        self.logger = StructuredLogger("navigator", "DEBUG" if verbose else "INFO")
 
     def get_ui_hierarchy(self) -> str:
         """Get UI hierarchy dump from device"""
+        op_id = self.logger.start_operation("get_ui_hierarchy", {
+            "device_id": self.device_id or "default"
+        })
+
         try:
             cmd = f"adb {self.device_prefix} shell uiautomator dump"
             result = subprocess.run(
                 cmd.split(),
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                timeout=10
             )
 
             if result.returncode == 0:
@@ -61,22 +76,52 @@ class AndroidNavigator:
                         cat_cmd.split(),
                         capture_output=True,
                         text=True,
-                        check=True
+                        check=True,
+                        timeout=5
                     )
+                    self.logger.complete_operation(op_id, True, {"xml_length": len(cat_result.stdout)})
                     return cat_result.stdout
 
             raise Exception("Could not get UI hierarchy dump")
 
         except subprocess.CalledProcessError as e:
-            print(f"Error getting UI hierarchy: {e}", file=sys.stderr)
+            error = self.error_handler.handle_error(e, {
+                "command": cmd,
+                "return_code": e.returncode,
+                "device": self.device_id
+            })
+            self.logger.log_error(error, {"operation": "get_ui_hierarchy"})
+            self.logger.complete_operation(op_id, False)
+            return ""
+
+        except subprocess.TimeoutExpired as e:
+            error = self.error_handler.handle_error(e, {
+                "command": cmd,
+                "timeout": 10,
+                "device": self.device_id
+            })
+            self.logger.log_error(error, {"operation": "get_ui_hierarchy"})
+            self.logger.complete_operation(op_id, False)
+            return ""
+
+        except Exception as e:
+            error = self.error_handler.handle_error(e, {"operation": "get_ui_hierarchy"})
+            self.logger.log_error(error)
+            self.logger.complete_operation(op_id, False)
             return ""
 
     def parse_ui_hierarchy(self, xml_content: str) -> List[Dict[str, Any]]:
         """Parse UI hierarchy XML and extract elements"""
         import xml.etree.ElementTree as ET
 
+        op_id = self.logger.start_operation("parse_ui_hierarchy", {
+            "xml_length": len(xml_content)
+        })
+
         try:
             if not xml_content or not xml_content.strip():
+                self.logger.warning("Empty XML content provided")
+                self.logger.complete_operation(op_id, True, {"elements": 0})
                 return []
 
             root = ET.fromstring(xml_content)
@@ -125,10 +170,27 @@ class AndroidNavigator:
                 return extracted
 
             elements.extend(extract_node_info(root))
+
+            self.logger.complete_operation(op_id, True, {
+                "elements": len(elements),
+                "interactive_elements": len([e for e in elements if e['clickable']])
+            })
+
             return elements
 
         except ET.ParseError as e:
-            print(f"Error parsing XML: {e}", file=sys.stderr)
+            error = self.error_handler.handle_error(e, {
+                "xml_length": len(xml_content),
+                "xml_preview": xml_content[:100] + "..." if len(xml_content) > 100 else xml_content
+            })
+            self.logger.log_error(error, {"operation": "parse_ui_hierarchy"})
+            self.logger.complete_operation(op_id, False)
+            return []
+
+        except Exception as e:
+            error = self.error_handler.handle_error(e, {"operation": "parse_ui_hierarchy"})
+            self.logger.log_error(error)
+            self.logger.complete_operation(op_id, False)
             return []
 
     def parse_bounds(self, bounds_str: str) -> Dict[str, int]:
@@ -233,30 +295,56 @@ class AndroidNavigator:
                      timeout: int = 10,
                      min_confidence: float = 0.3) -> Optional[Dict[str, Any]]:
         """Enhanced element finding with multiple matching strategies"""
+        op_id = self.logger.start_operation("find_element", {
+            "element_type": element_type,
+            "element_text": element_text,
+            "element_id": element_id,
+            "timeout": timeout,
+            "min_confidence": min_confidence
+        })
+
+        search_criteria = {
+            "type": element_type,
+            "text": element_text,
+            "id": element_id
+        }
+
+        self.logger.debug("Starting element search", search_criteria)
+
         start_time = time.time()
+        attempts = 0
 
         while time.time() - start_time < timeout:
+            attempts += 1
+
             if not elements:
                 # Refresh UI hierarchy if no elements available
+                self.logger.debug("No elements available, refreshing UI hierarchy")
                 xml_content = self.get_ui_hierarchy()
                 elements = self.parse_ui_hierarchy(xml_content)
-                time.sleep(1)
-                continue
+                if not elements:
+                    time.sleep(1)
+                    continue
+
+            self.logger.debug(f"Search attempt {attempts}, checking {len(elements)} elements")
 
             best_match = None
             best_score = 0.0
+            matching_elements = 0
 
             for element in elements:
                 if not element['enabled']:
                     continue  # Skip disabled elements
 
                 score = 0.0
+                element_matches = False
 
                 # Type matching (if specified)
                 if element_type:
                     type_match_score = self.fuzzy_text_match(element_type, element['type'], 0.9)
                     if type_match_score > 0.5:
                         score += type_match_score * 0.3
+                        element_matches = True
                     else:
                         continue  # Type mismatch, skip this element
 
@@ -269,6 +357,7 @@ class AndroidNavigator:
                     )
                     if text_score > 0.3:
                         score += text_score * 0.5
+                        element_matches = True
                     else:
                         # Try next element even if no text match if type matched
                         pass
@@ -277,8 +366,13 @@ class AndroidNavigator:
                 if element_id:
                     if element_id in element['resource_id']:
                         score += 0.2  # ID matching bonus
+                        element_matches = True
                     elif element_id.lower() in element['resource_id'].lower():
                         score += 0.15  # Partial ID match bonus
+                        element_matches = True
+
+                if element_matches:
+                    matching_elements += 1
 
                 # Preference for clickable elements
                 if element['clickable']:
@@ -292,8 +386,17 @@ class AndroidNavigator:
                     best_score = score
                     best_match = element
 
+            self.logger.debug(f"Attempt {attempts}: {matching_elements} matching elements, best score: {best_score:.3f}")
+
             # Return best match if confidence threshold met
             if best_match and best_score >= min_confidence:
+                result = {
+                    "element": best_match,
+                    "confidence": best_score,
+                    "attempts": attempts,
+                    "search_time": time.time() - start_time
+                }
+                self.logger.complete_operation(op_id, True, result)
                 return best_match
 
             # If no good match found, refresh and try again
@@ -301,6 +404,29 @@ class AndroidNavigator:
             xml_content = self.get_ui_hierarchy()
             elements = self.parse_ui_hierarchy(xml_content)
 
+        # Element not found after timeout
+        error = self.error_handler.handle_error(
+            Exception(f"Element not found after {attempts} attempts and {timeout}s timeout"),
+            {
+                "search_criteria": search_criteria,
+                "attempts": attempts,
+                "elements_checked": len(elements),
+                "timeout": timeout
+            }
+        )
+
+        self.logger.log_error(error, {
+            "search_criteria": search_criteria,
+            "attempts": attempts
+        })
+
+        result = {
+            "element": None,
+            "confidence": 0.0,
+            "attempts": attempts,
+            "search_time": time.time() - start_time
+        }
+        self.logger.complete_operation(op_id, False, result)
         return None
 
     def get_center_coords(self, element: Dict[str, Any]) -> Tuple[int, int]:
@@ -390,6 +516,11 @@ class AndroidNavigator:
 
     def run(self, **kwargs) -> Dict[str, Any]:
         """Main execution method"""
+        main_op_id = self.logger.start_operation("navigator_main", {
+            "device_id": self.device_id or "default",
+            "actions": {k: v for k, v in kwargs.items() if v is not None}
+        })
+
         result = {
             'success': False,
             'error': None,
@@ -398,19 +529,40 @@ class AndroidNavigator:
         }
 
         try:
-            # Check device connection
-            cmd = f"adb {self.device_prefix} devices".split()
-            device_result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            lines = device_result.stdout.strip().split('\n')[1:]  # Skip header
+            # Validate required tools
+            tools_status = validate_required_tools()
+            if not tools_status.get("adb", False):
+                raise Exception("ADB is not available. Please install Android SDK platform-tools.")
 
-            if not lines or not any('device' in line for line in lines):
-                result['error'] = "No connected devices found"
+            # Check device connection
+            op_id = self.logger.start_operation("check_device_connection")
+            try:
+                cmd = f"adb {self.device_prefix} devices".split()
+                device_result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=5)
+                lines = device_result.stdout.strip().split('\n')[1:]  # Skip header
+
+                if not lines or not any('device' in line for line in lines):
+                    raise Exception("No connected devices found")
+
+                self.logger.complete_operation(op_id, True, {"devices": len([l for l in lines if 'device' in l])})
+
+            except Exception as e:
+                error = self.error_handler.handle_error(e, {"device": self.device_id})
+                self.logger.log_error(error)
+                self.logger.complete_operation(op_id, False)
+                result['error'] = error.message
+                self.logger.complete_operation(main_op_id, False)
                 return result
 
             # Get UI hierarchy
             xml_content = self.get_ui_hierarchy()
             if not xml_content:
-                result['error'] = "Could not retrieve UI hierarchy"
+                error = self.error_handler.handle_error(
+                    Exception("Could not retrieve UI hierarchy"),
+                    {"device": self.device_id}
+                )
+                result['error'] = error.message
+                self.logger.complete_operation(main_op_id, False)
                 return result
 
             elements = self.parse_ui_hierarchy(xml_content)
@@ -435,21 +587,47 @@ class AndroidNavigator:
                             self.wait(kwargs['wait'])
 
                         if kwargs.get('tap'):
+                            op_id = self.logger.start_operation("tap_element", {
+                                "element_type": element['type'],
+                                "long_press": kwargs.get('long_press', False)
+                            })
                             success = self.tap_element(element, kwargs.get('long_press', False))
                             result['action_taken'] = f"tap_{element['type']}"
+                            self.logger.complete_operation(op_id, success)
                         elif kwargs.get('enter_text'):
+                            op_id = self.logger.start_operation("enter_text", {
+                                "element_type": element['type'],
+                                "text_length": len(kwargs.get('enter_text', ''))
+                            })
                             success = self.enter_text(element, kwargs['enter_text'])
                             result['action_taken'] = f"enter_text_in_{element['type']}"
+                            self.logger.complete_operation(op_id, success)
 
                         if not success:
-                            result['error'] = f"Failed to execute action on element"
+                            error = self.error_handler.handle_error(
+                                Exception(f"Failed to execute action on element: {result['action_taken']}"),
+                                {"element": element, "action": result['action_taken']}
+                            )
+                            result['error'] = error.message
+                            self.logger.complete_operation(main_op_id, False)
                             return result
 
                         # Wait after action if specified
                         if kwargs.get('wait'):
                             self.wait(kwargs['wait'])
                 else:
-                    result['error'] = "Element not found"
+                    error = self.error_handler.handle_error(
+                        Exception("Element not found"),
+                        {
+                            "search_criteria": {
+                                "type": kwargs.get('find_type'),
+                                "text": kwargs.get('find_text'),
+                                "id": kwargs.get('find_id')
+                            }
+                        }
+                    )
+                    result['error'] = error.message
+                    self.logger.complete_operation(main_op_id, False)
                     return result
 
             # Handle swipe/scroll actions
@@ -457,32 +635,55 @@ class AndroidNavigator:
                 if kwargs.get('wait'):
                     self.wait(kwargs['wait'])
 
+                op_id = self.logger.start_operation("swipe", {"direction": kwargs['swipe']})
                 success = self.swipe(kwargs['swipe'])
                 result['action_taken'] = f"swipe_{kwargs['swipe']}"
+                self.logger.complete_operation(op_id, success)
+
                 if not success:
-                    result['error'] = "Failed to perform swipe"
+                    error = self.error_handler.handle_error(
+                        Exception(f"Failed to perform swipe: {kwargs['swipe']}"),
+                        {"direction": kwargs['swipe']}
+                    )
+                    result['error'] = error.message
+                    self.logger.complete_operation(main_op_id, False)
                     return result
 
             if kwargs.get('scroll'):
                 if kwargs.get('wait'):
                     self.wait(kwargs['wait'])
 
+                op_id = self.logger.start_operation("scroll")
                 success = self.scroll()
                 result['action_taken'] = "scroll"
+                self.logger.complete_operation(op_id, success)
+
                 if not success:
-                    result['error'] = "Failed to scroll"
+                    error = self.error_handler.handle_error(Exception("Failed to scroll"))
+                    result['error'] = error.message
+                    self.logger.complete_operation(main_op_id, False)
                     return result
 
             # Just waiting
             if kwargs.get('wait'):
+                op_id = self.logger.start_operation("wait", {"seconds": kwargs['wait']})
                 self.wait(kwargs['wait'])
                 result['action_taken'] = f"wait_{kwargs['wait']}_seconds"
+                self.logger.complete_operation(op_id, True)
 
             result['success'] = True
+
+            # Add performance metrics to result
+            result['performance'] = self.logger.get_performance_report()
+            self.logger.complete_operation(main_op_id, True)
             return result
 
         except Exception as e:
-            result['error'] = str(e)
+            error = self.error_handler.handle_error(e, {"operation": "navigator_main"})
+            self.logger.log_error(error)
+            result['error'] = error.message
+            result['performance'] = self.logger.get_performance_report()
+            self.logger.complete_operation(main_op_id, False)
             return result
 
 def main():
@@ -567,10 +768,22 @@ Examples:
     # Validate arguments
     if args.tap or args.enter_text:
         if not (args.find_type or args.find_text or args.find_id):
-            print("Error: Must specify --find-type, --find-text, or --find-id when using --tap or --enter-text", file=sys.stderr)
+            error = AndroidAutomationError(
+                "Must specify --find-type, --find-text, or --find-id when using --tap or --enter-text",
+                category=ErrorCategory.VALIDATION,
+                severity=ErrorSeverity.LOW,
+                suggestions=[
+                    "Add --find-type BUTTON to search by element type",
+                    "Add --find-text \"Button Text\" to search by visible text",
+                    "Add --find-id button_id to search by resource ID"
+                ]
+            )
+            error_handler = ErrorHandler("navigator")
+            print(error_handler.format_error_output(error, args.json), file=sys.stderr)
             sys.exit(1)
 
-    navigator = AndroidNavigator(args.device)
+    # Initialize navigator with logging level based on verbose flag
+    navigator = AndroidNavigator(args.device, args.verbose)
 
     # Convert args to dictionary
     kwargs = {
@@ -590,23 +803,41 @@ Examples:
     result = navigator.run(**kwargs)
 
     if not result['success']:
-        if args.json:
-            print(json.dumps(result, indent=2))
-        else:
-            print(f"Error: {result['error']}", file=sys.stderr)
+        print(navigator.error_handler.format_error_output(
+            navigator.error_handler.handle_error(
+                Exception(result['error']),
+                {"operation": "main_execution"}
+            ),
+            args.json
+        ), file=sys.stderr)
         sys.exit(1)
 
     if args.json:
+        # Enhanced JSON output with performance metrics
         output = {
             'success': result['success'],
             'data': result['data'],
             'action_taken': result['action_taken']
         }
-        print(json.dumps(output, indent=2))
+
+        # Add performance metrics if available
+        if 'performance' in result:
+            output['performance'] = result['performance']
+
+        print(format_json_output(output))
     elif args.verbose:
-        print(f"Action taken: {result['action_taken']}")
+        print(f"✅ Action taken: {result['action_taken']}")
         if result['data']:
-            print(f"Element details: {result['data']}")
+            print(f"📱 Element details: {result['data']}")
+
+        # Show performance summary
+        if 'performance' in result:
+            perf = result['performance']
+            print(f"⏱️  Total runtime: {perf.get('total_runtime', 0):.2f}s")
+            print(f"📊 Operations: {perf.get('total_operations', 0)}")
+            print(f"✅ Success rate: {perf.get('success_rate', 0):.1%}")
+    else:
+        print(f"✅ {result['action_taken']}")
 
 if __name__ == '__main__':
     main()
