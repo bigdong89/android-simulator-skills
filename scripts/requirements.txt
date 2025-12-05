@@ -1,0 +1,16 @@
+# Python dependencies for Android Simulator Scripts
+# Install with: pip install -r requirements.txt
+
+# UIAutomator2 - Android UI testing framework
+# Documentation: https://github.com/openatx/uiautomator2
+uiautomator2>=3.0.0
+
+# Pillow - Image processing library
+# Documentation: https://pillow.readthedocs.io/
+Pillow>=10.0.0
+
+# Optional: For enhanced image processing
+# opencv-python>=4.5.0
+
+# Optional: For better JSON handling
+# jsonschema>=4.0.0
