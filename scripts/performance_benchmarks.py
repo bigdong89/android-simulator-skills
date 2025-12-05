@@ -73,8 +73,20 @@ class PerformanceBenchmark:
                 final_memory = process.memory_info().rss / 1024 / 1024  # MB
                 memory_usage = max(0, final_memory - initial_memory)
 
-                success = result.returncode == 0
-                error_msg = None if success else result.stderr.strip()
+                # Special handling for accessibility audit - critical issues result in exit code 1 but that's expected
+                script_name = cmd[1] if len(cmd) > 1 else ""
+                is_accessibility_audit = "accessibility_audit.py" in script_name
+
+                if is_accessibility_audit:
+                    # For accessibility audit, check if it ran successfully (found issues or not)
+                    success = result.returncode in [0, 1]  # Both success and critical issues are "successful" runs
+                    if result.returncode == 1 and not result.stderr.strip():
+                        error_msg = None  # Critical accessibility issues found, but script worked
+                    else:
+                        error_msg = result.stderr.strip() if result.stderr else None
+                else:
+                    success = result.returncode == 0
+                    error_msg = None if success else result.stderr.strip()
 
                 results.append(BenchmarkResult(
                     script_name=script_name,
@@ -216,7 +228,7 @@ class PerformanceBenchmark:
         results = self.measure_script_performance(
             "app_launcher.py",
             "check_app_state",
-            ["--check", "com.android.settings"],
+            ["--state", "com.android.settings"],
             iterations
         )
         self.results.extend(results)

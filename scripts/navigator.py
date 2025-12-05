@@ -151,12 +151,88 @@ class AndroidNavigator:
 
         return {'x1': 0, 'y1': 0, 'x2': 0, 'y2': 0}
 
+    def fuzzy_text_match(self, target: str, candidate: str, similarity_threshold: float = 0.7) -> float:
+        """Calculate fuzzy text similarity using Levenshtein distance"""
+        if not target or not candidate:
+            return 0.0
+
+        # Normalize both strings (lowercase, trim whitespace)
+        target_norm = target.lower().strip()
+        candidate_norm = candidate.lower().strip()
+
+        if target_norm == candidate_norm:
+            return 1.0
+
+        # Simple Levenshtein distance implementation
+        m, n = len(target_norm), len(candidate_norm)
+        if m == 0: return 0.0
+        if n == 0: return 0.0
+
+        # Create distance matrix
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        for i in range(1, m + 1):
+            dp[i][0] = i
+
+        for j in range(1, n + 1):
+            dp[0][j] = j
+
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if target_norm[i-1] == candidate_norm[j-1]:
+                    dp[i][j] = dp[i-1][j-1]
+                elif i == 1:
+                    dp[i][j] = min(dp[i-1][j], dp[i][j-1])
+                else:
+                    dp[i][j] = 1 + min(dp[i-1][j-1], dp[i-1][j], dp[i][j-1])
+
+        # Calculate similarity
+        distance = dp[m][n]
+        similarity = (max(m, n) - distance) / max(m, n)
+        return similarity
+
+    def enhanced_text_match(self, target: str, text_field: str, content_desc: str) -> float:
+        """Enhanced text matching with multiple strategies"""
+        if not target:
+            return 0.0
+
+        max_score = 0.0
+
+        # Strategy 1: Exact match in text field
+        if text_field and target.lower() == text_field.lower():
+            max_score = 1.0
+
+        # Strategy 2: Exact match in content description
+        if content_desc and target.lower() == content_desc.lower():
+            max_score = max(max_score, 0.9)
+
+        # Strategy 3: Fuzzy matching in text field
+        if text_field:
+            fuzzy_score = self.fuzzy_text_match(target, text_field, 0.8)
+            max_score = max(max_score, fuzzy_score * 0.9)  # Slightly lower weight for fuzzy
+
+        # Strategy 4: Fuzzy matching in content description
+        if content_desc:
+            fuzzy_score = self.fuzzy_text_match(target, content_desc, 0.8)
+            max_score = max(max_score, fuzzy_score * 0.8)  # Lower weight for description
+
+        # Strategy 5: Partial matching (contains)
+        if text_field and target.lower() in text_field.lower():
+            partial_score = len(target) / len(text_field)
+            max_score = max(max_score, partial_score * 0.7)
+
+        if content_desc and target.lower() in content_desc.lower():
+            partial_score = len(target) / len(content_desc)
+            max_score = max(max_score, partial_score * 0.6)
+
+        return max_score
+
     def find_element(self, elements: List[Dict[str, Any]],
                      element_type: Optional[str] = None,
                      element_text: Optional[str] = None,
                      element_id: Optional[str] = None,
-                     timeout: int = 10) -> Optional[Dict[str, Any]]:
-        """Find element matching specified criteria"""
+                     timeout: int = 10,
+                     min_confidence: float = 0.3) -> Optional[Dict[str, Any]]:
+        """Enhanced element finding with multiple matching strategies"""
         start_time = time.time()
 
         while time.time() - start_time < timeout:
@@ -167,31 +243,60 @@ class AndroidNavigator:
                 time.sleep(1)
                 continue
 
+            best_match = None
+            best_score = 0.0
+
             for element in elements:
-                match = True
+                if not element['enabled']:
+                    continue  # Skip disabled elements
 
+                score = 0.0
+
+                # Type matching (if specified)
                 if element_type:
-                    if element_type.lower() not in element['type'].lower():
-                        match = False
+                    type_match_score = self.fuzzy_text_match(element_type, element['type'], 0.9)
+                    if type_match_score > 0.5:
+                        score += type_match_score * 0.3
+                    else:
+                        continue  # Type mismatch, skip this element
 
+                # Text matching (if specified)
                 if element_text:
-                    # Fuzzy matching for text
-                    if not element_text.lower() in (element['text'].lower() or ''):
-                        if not element_text.lower() in (element['content_description'].lower() or ''):
-                            match = False
+                    text_score = self.enhanced_text_match(
+                        element_text,
+                        element['text'],
+                        element['content_description']
+                    )
+                    if text_score > 0.3:
+                        score += text_score * 0.5
+                    else:
+                        # Try next element even if no text match if type matched
+                        pass
 
+                # ID matching (if specified)
                 if element_id:
-                    if not element_id in element['resource_id']:
-                        match = False
+                    if element_id in element['resource_id']:
+                        score += 0.2  # ID matching bonus
+                    elif element_id.lower() in element['resource_id'].lower():
+                        score += 0.15  # Partial ID match bonus
 
-                # Only consider enabled, interactive elements
-                if match and not element['enabled']:
-                    match = False
+                # Preference for clickable elements
+                if element['clickable']:
+                    score += 0.1
 
-                if match:
-                    return element
+                # Preference for elements with any descriptive content
+                if element['text'] or element['content_description']:
+                    score += 0.05
 
-            # If no match found, refresh and try again
+                if score > best_score:
+                    best_score = score
+                    best_match = element
+
+            # Return best match if confidence threshold met
+            if best_match and best_score >= min_confidence:
+                return best_match
+
+            # If no good match found, refresh and try again
             time.sleep(1)
             xml_content = self.get_ui_hierarchy()
             elements = self.parse_ui_hierarchy(xml_content)
